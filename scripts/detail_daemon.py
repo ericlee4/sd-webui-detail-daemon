@@ -332,8 +332,10 @@ class Script(scripts.Script):
         multipliers[start_idx:mid_idx+1] = start_values
         multipliers[mid_idx:end_idx+1] = end_values        
         multipliers[:start_idx] = start_offset
-        multipliers[end_idx+1:] = end_offset    
-        multipliers *= 1 - fade
+        multipliers[end_idx+1:] = end_offset
+
+        mask = multipliers > 0
+        multipliers[mask] *= np.linspace(1.0, 1.0 - fade, mask.sum())
 
         return multipliers
 

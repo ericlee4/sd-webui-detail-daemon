@@ -348,8 +348,7 @@ class Script(scripts.Script):
             if start > end:
                 start = end
             mid = start + bias * (end - start)
-            opacity = .1 + (1 - fade) * 0.7
-            plot_color = (0.5, 0.5, 0.5, opacity) if not enabled else ((1 - peak)**2, 1, 0, opacity) if mean >= 0 else (1, (1 - peak)**2, 0, opacity) 
+            plot_color = (0.5, 0.5, 0.5, 1) if not enabled else ((1 - peak)**2, 1, 0, 1) if mean >= 0 else (1, (1 - peak)**2, 0, 1) 
 
             plt.rcParams.update({
                 "text.color":  plot_color, 
@@ -373,7 +372,7 @@ class Script(scripts.Script):
             ax_main.set_xlim([0, steps - 1])
             plt.close(fig_main)
 
-            plot_color = (0.5, 0.5, 0.5, .1) if not enabled else (0.75, 0.75, 0.75, opacity) 
+            plot_color = (0.5, 0.5, 0.5, .1) if not enabled else (0.75, 0.75, 0.75, 1) 
             plt.rcParams.update({
                 "text.color":  plot_color, 
                 "axes.labelcolor":  plot_color, 

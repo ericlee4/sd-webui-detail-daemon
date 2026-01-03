@@ -1,9 +1,12 @@
 import os
+
 import gradio as gr
+import matplotlib
 import numpy as np
+import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
-import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
@@ -30,7 +33,7 @@ on_ui_settings(add_settings)
 def parse_infotext(infotext, params):
     try:
         raw = params['Detail Daemon']
-        if raw.startswith("D"):  
+        if raw.startswith("D"):
             daemons = raw.split(";")
             if len(daemons) > shared.opts.data.get("detail_daemon_count", 6):
                 tqdm.write(f"\033[31mDetail Daemon:\033[0m Need more daemons! Go to 'Settings > Uncategorized > Detail Daemon' and increase count to {len(daemons)}.")
@@ -50,6 +53,9 @@ def parse_infotext(infotext, params):
                 dd_dict[f"ed_offset{idx + 1 if idx > 0 else ''}"] = float(vals[9])
                 dd_dict[f"fade{idx + 1 if idx > 0 else ''}"] = float(vals[10])
                 dd_dict[f"smooth{idx + 1 if idx > 0 else ''}"] = bool(int(vals[11]))
+                dd_dict[f"noisetarget{idx + 1 if idx > 0 else ''}"] = bool(int(vals[12]))
+                dd_dict[f"textcond_percent{idx + 1 if idx > 0 else ''}"] = float(vals[13])
+                dd_dict[f"noise_frequency{idx + 1 if idx > 0 else ''}"] = float(vals[13])
             params['Detail Daemon'] = dd_dict
         else:
             # fallback to old format for backward compatibility
@@ -101,7 +107,8 @@ class Script(scripts.Script):
                         params_set = []
                         with gr.Row():
                             gr_active = gr.Checkbox(label="Active", value=False, min_width=60, elem_classes=['detail-daemon-active']) 
-                            gr_hires = gr.Checkbox(label="Hires Pass", value=False, min_width=60, elem_classes=['detail-daemon-hires']) 
+                            gr_hires = gr.Checkbox(label="Hires Pass", value=False, min_width=60, elem_classes=['detail-daemon-hires'])
+                            gr_noisetarget = gr.Radio(choices=[("Sigma", "sigma"), ("Latent", "latent"), ("Text Conditioning", "textcond")], value="sigma", label="Noise Target")
                         with gr.Row():
                             with gr.Column(scale=2, elem_classes=['detail-daemon-params']):                    
                                 gr_amount_slider = gr.Slider(minimum=-1.00, maximum=1.00, step=.01, value=0.10, label="Detail Amount")
@@ -115,7 +122,22 @@ class Script(scripts.Script):
                                     gr_bias = gr.Slider(minimum=0.0, maximum=1.0, step=.01, value=0.5, label="Bias", min_width=60)
                                     gr_exponent = gr.Slider(minimum=0.0, maximum=10.0, step=.05, value=1.0, label="Exponent", min_width=60)
                                 gr_fade = gr.Slider(minimum=0.0, maximum=1.0, step=.05, value=0.0, label="Fade", min_width=60)
-                            with gr.Column(scale=1, min_width=275):  
+                                with gr.Group(visible=False) as gr_textcond_settings:
+                                    gr_textcond_percent = gr.Slider(minimum=0.0, maximum=1.0, step=.05, value=0.35, label="Text Cond Noise %",  min_width=60)
+                                with gr.Group(visible=False) as gr_latent_settings:
+                                    # TODO fix ranges
+                                    gr_noise_frequency = gr.Slider(minimum=1, maximum=1024, step=1, value=32, label="Noise Frequency (Inverse)")
+
+                                def update_noise_target_visibility(target):
+                                    return [
+                                        gr.update(visible=target == "textcond"),
+                                        gr.update(visible=target == "latent")
+                                    ]
+
+                                gr_noisetarget.change(fn=update_noise_target_visibility, inputs=[gr_noisetarget], outputs=[gr_textcond_settings, gr_latent_settings])
+
+                                gr_luminosity_threshold = gr.Slider(minimum=0.0, maximum=1.0, step=.05, value=0, label="Noise Luminosity Threshold", min_width=60)
+                            with gr.Column(scale=1, min_width=275):
                                 preview, _ = self.visualize(False, 0.2, 0.8, 0.5, 0.1, 1, 0, 0, 0, True, 'both', False)                                 
                                 gr_vis = gr.Plot(value=preview, elem_classes=['detail-daemon-vis'], show_label=False)
                                 gr_smooth = gr.Checkbox(label="Smooth", value=True, min_width=60, elem_classes=['detail-daemon-smooth'])
@@ -147,7 +169,7 @@ class Script(scripts.Script):
 
                         params_set = [
                             gr_active, gr_hires, gr_mode, gr_start, gr_end, gr_bias, gr_amount,
-                            gr_exponent, gr_start_offset, gr_end_offset, gr_fade, gr_smooth
+                            gr_exponent, gr_start_offset, gr_end_offset, gr_fade, gr_smooth, gr_noisetarget, gr_textcond_percent, gr_noise_frequency, gr_luminosity_threshold
                         ]
                         all_params.extend(params_set)
 
@@ -155,7 +177,7 @@ class Script(scripts.Script):
                         # older single daemon DD was backward compatible with yet older DD which had infotext with the DD_stuff format, so that's handled here too
                         if i == 0 :
                             self.tab_param_count = len(params_set)
-                            self.infotext_fields.extend([                        
+                            self.infotext_fields.extend([
                                 (gr_active, lambda d: extract_infotext(d, 'active') or 'Detail Daemon' in d or 'DD_enabled' in d),
                                 (gr_hires, lambda d: extract_infotext(d, 'hr') or False),
                                 (gr_mode, lambda d: extract_infotext(d, 'mode', 'DD_mode')),
@@ -168,9 +190,13 @@ class Script(scripts.Script):
                                 (gr_end_offset, lambda d: extract_infotext(d, 'ed_offset', 'DD_end_offset')),
                                 (gr_fade, lambda d: extract_infotext(d, 'fade', 'DD_fade')),
                                 (gr_smooth, lambda d: extract_infotext(d, 'smooth', 'DD_smooth')),
+                                (gr_noisetarget, lambda d: extract_infotext(d, 'noisetarget')),
+                                (gr_textcond_percent, lambda d: extract_infotext(d, 'textcond_percent')),
+                                (gr_noise_frequency, lambda d: extract_infotext(d, 'noise_frequency')),
+                                (gr_luminosity_threshold, lambda d: extract_infotext(d, 'luminosity_threshold')),
                             ])
-                        else:                        
-                            tab_tag = i + 1 
+                        else:
+                            tab_tag = i + 1
                             self.infotext_fields.extend([
                                 (gr_active, lambda d, key=f'active{tab_tag}': extract_infotext(d, key) or False),
                                 (gr_hires, lambda d, key=f'hr{tab_tag}': extract_infotext(d, key)),
@@ -184,10 +210,14 @@ class Script(scripts.Script):
                                 (gr_end_offset, lambda d, key=f'ed_offset{tab_tag}': extract_infotext(d, key)),
                                 (gr_fade, lambda d, key=f'fade{tab_tag}': extract_infotext(d, key)),
                                 (gr_smooth, lambda d, key=f'smooth{tab_tag}': extract_infotext(d, key)),
+                                (gr_noisetarget, lambda d, key=f'noisetarget{tab_tag}': extract_infotext(d, key)),
+                                (gr_textcond_percent, lambda d, key=f'textcond_percent{tab_tag}': extract_infotext(d, key)),
+                                (gr_noise_frequency, lambda d, key=f'latent_frequency{tab_tag}': extract_infotext(d, key)),
+                                (gr_luminosity_threshold, lambda d, key=f'luminosity_threshold{tab_tag}': extract_infotext(d, key)),
                             ])
         return all_params
     
-    def process(self, p, enabled, *all_daemon_args):    
+    def process(self, p, enabled, *all_daemon_args):
         if not enabled:
             if hasattr(self, 'callback_added'):
                 remove_callbacks_for_function(self.denoiser_callback)
@@ -207,7 +237,7 @@ class Script(scripts.Script):
             end_idx = start_idx + self.tab_param_count
             daemon_args = all_daemon_args[start_idx:end_idx]
 
-            active, hires, mode, start, end, bias, amount, exponent, start_offset, end_offset, fade, smooth = daemon_args
+            active, hires, mode, start, end, bias, amount, exponent, start_offset, end_offset, fade, smooth, noisetarget, textcond_percent, noise_frequency, luminosity_threshold = daemon_args
 
             # TODO? XYZ support for other channels
             if (i == 0) :
@@ -221,6 +251,10 @@ class Script(scripts.Script):
                 end_offset = getattr(p, "DD_end_offset", end_offset)
                 fade = getattr(p, "DD_fade", fade)
                 smooth = getattr(p, "DD_smooth", smooth)
+                noisetarget = getattr(p, "DD_luminosity_threshold", luminosity_threshold)
+                textcond_percent = getattr(p, "DD_textcond_percent", textcond_percent)
+                noise_frequency = getattr(p, "DD_noise_frequency", noise_frequency)
+                luminosity_threshold = getattr(p, "DD_luminosity_threshold", luminosity_threshold)
 
             if active:
                 daemon_schedule_params = {
@@ -240,13 +274,17 @@ class Script(scripts.Script):
                     'mode': mode, 
                     'schedule': None, 
                     'schedule_params': daemon_schedule_params, 
-                    'hires': hires, 
-                    'multiplier': .1  # Add slider for this?
+                    'hires': hires,
+                    'multiplier': .1,  # Add slider for this?
+                    noisetarget: noisetarget,
+                    textcond_percent: textcond_percent,
+                    noise_frequency: noise_frequency,
+                    luminosity_threshold: luminosity_threshold
                 })
                 
                 text = ",".join([
-                    str(int(active)), str(int(hires)), mode, f"{amount}", f"{start}", f"{end}", f"{bias}", 
-                    f"{exponent}", f"{start_offset}", f"{end_offset}", f"{fade:}", str(int(smooth))
+                    str(int(active)), str(int(hires)), mode, f"{amount}", f"{start}", f"{end}", f"{bias}",
+                    f"{exponent}", f"{start_offset}", f"{end_offset}", f"{fade:}", str(int(smooth)), str(int(noisetarget)), str(textcond_percent), str(noise_frequency), str(luminosity_threshold)
                 ])
                 extra_gen_texts.append(f"D{i+1}:{text}")
         
@@ -288,6 +326,7 @@ class Script(scripts.Script):
             
             schedule = daemon['schedule']   
             multiplier = schedule[idx] * daemon['multiplier']
+            noisetarget = daemon['noisetarget']
 
             if is_forge:
                 if idx == 0 and mode != "both":
@@ -301,11 +340,43 @@ class Script(scripts.Script):
                 for i in range(self.batch_size):
                     params.sigma[self.batch_size + i] *= 1 + multiplier
             else:
-                params.sigma *= 1 - multiplier * self.cfg_scale
+                if noisetarget == "textcond":
+                    cond: torch.Tensor = params.text_cond
+                    b, t, c = cond.shape
+                    rms = cond.detach().float().pow(2).mean(dim=(1, 2), keepdim=True).sqrt()
+                    noise = torch.rand((b, t, c), dtype=torch.float32, device=cond.device) * 2.0 - 1.0
+                    noise = (noise * (schedule[idx] * rms)).to(cond.dtype)
+                    noise_mask = torch.bernoulli(
+                        torch.full((b, t, 1), daemon["textcond_percent"], dtype=torch.float32, device=cond.device)
+                    ).to(cond.dtype)
+                    params.text_cond = cond.detach() + noise * noise_mask
+                elif noisetarget == "latent":
+                    batch, channels, h, w = params.x.shape
+                    freq = daemon["noise_frequency"]
+                    low_res = torch.randn((batch, channels, h // freq, w // freq), device=params.x.device, dtype=params.x.dtype)
+                    blobs = F.interpolate(low_res, size=(h, w), mode='bicubic', align_corners=False)
+                    blobs = (blobs - blobs.mean()) / (blobs.std() + 1e-6)
+                    scheduleval = float(schedule[idx])
+                    params.x = (1.0 - scheduleval**2)**0.5 * params.x + scheduleval * blobs
+                else:
+                    threshold = daemon.get("luminosity_threshold", 0)
+
+                    if threshold == 0:
+                        params.sigma *= 1 - multiplier * self.cfg_scale
+                    else:
+                        latent_brightness = params.x[:, 0, :, :].detach()
+                        b_min, b_max = latent_brightness.min(), latent_brightness.max()
+                        lum_mask = (latent_brightness - b_min) / (b_max - b_min + 1e-6)
+                        steepness = 10.0
+                        soft_mask = torch.sigmoid(steepness * (lum_mask - threshold))
+                        num_channels = params.x.shape[1]
+                        final_mask = soft_mask.unsqueeze(1).repeat(1, num_channels, 1, 1)
+                        params.x = params.x * (1 - (schedule[idx] * final_mask))
 
             if shared.opts.data.get("detail_daemon_verbose", False):
-                tqdm.write(f'\033[32mDetail Daemon:\033[0m {name} | sigma: {params.sigma} | step: {idx}/{actual_steps - 1} | multiplier: {multiplier:.4f}')  
-    
+                tqdm.write(f'\033[32mDetail Daemon:\033[0m {name} | sigma: {params.sigma} | step: {idx}/{actual_steps - 1} | multiplier: {multiplier:.4f}')
+
+
     def make_schedule(self, steps, start, end, bias, amount, exponent, start_offset, end_offset, fade, smooth):
         start = min(start, end)
         mid = start + bias * (end - start)
@@ -348,7 +419,7 @@ class Script(scripts.Script):
             if start > end:
                 start = end
             mid = start + bias * (end - start)
-            plot_color = (0.5, 0.5, 0.5, 1) if not enabled else ((1 - peak)**2, 1, 0, 1) if mean >= 0 else (1, (1 - peak)**2, 0, 1) 
+            plot_color = (0.5, 0.5, 0.5, 1) if not enabled else ((1 - peak)**2, 1, 0, 1) if mean >= 0 else (1, (1 - peak)**2, 0, 1)
 
             plt.rcParams.update({
                 "text.color":  plot_color, 
@@ -372,7 +443,7 @@ class Script(scripts.Script):
             ax_main.set_xlim([0, steps - 1])
             plt.close(fig_main)
 
-            plot_color = (0.5, 0.5, 0.5, .1) if not enabled else (0.75, 0.75, 0.75, 1) 
+            plot_color = (0.5, 0.5, 0.5, .1) if not enabled else (0.75, 0.75, 0.75, 1)
             plt.rcParams.update({
                 "text.color":  plot_color, 
                 "axes.labelcolor":  plot_color, 

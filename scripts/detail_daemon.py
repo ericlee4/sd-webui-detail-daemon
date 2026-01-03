@@ -53,7 +53,7 @@ def parse_infotext(infotext, params):
                 dd_dict[f"ed_offset{idx + 1 if idx > 0 else ''}"] = float(vals[9])
                 dd_dict[f"fade{idx + 1 if idx > 0 else ''}"] = float(vals[10])
                 dd_dict[f"smooth{idx + 1 if idx > 0 else ''}"] = bool(int(vals[11]))
-                dd_dict[f"noisetarget{idx + 1 if idx > 0 else ''}"] = bool(int(vals[12]))
+                dd_dict[f"noisetarget{idx + 1 if idx > 0 else ''}"] = vals[12]
                 dd_dict[f"textcond_percent{idx + 1 if idx > 0 else ''}"] = float(vals[13])
                 dd_dict[f"noise_frequency{idx + 1 if idx > 0 else ''}"] = float(vals[13])
             params['Detail Daemon'] = dd_dict
@@ -192,7 +192,7 @@ class Script(scripts.Script):
                                 (gr_smooth, lambda d: extract_infotext(d, 'smooth', 'DD_smooth')),
                                 (gr_noisetarget, lambda d: extract_infotext(d, 'noisetarget')),
                                 (gr_textcond_percent, lambda d: extract_infotext(d, 'textcond_percent')),
-                                (gr_noise_frequency, lambda d: extract_infotext(d, 'noise_frequency')),
+                                (gr_noise_frequency, lambda d: extract_infotext(d, 'noise_frequency') or 32),
                                 (gr_luminosity_threshold, lambda d: extract_infotext(d, 'luminosity_threshold')),
                             ])
                         else:
@@ -251,7 +251,7 @@ class Script(scripts.Script):
                 end_offset = getattr(p, "DD_end_offset", end_offset)
                 fade = getattr(p, "DD_fade", fade)
                 smooth = getattr(p, "DD_smooth", smooth)
-                noisetarget = getattr(p, "DD_luminosity_threshold", luminosity_threshold)
+                noisetarget = getattr(p, "DD_noisetarget", noisetarget)
                 textcond_percent = getattr(p, "DD_textcond_percent", textcond_percent)
                 noise_frequency = getattr(p, "DD_noise_frequency", noise_frequency)
                 luminosity_threshold = getattr(p, "DD_luminosity_threshold", luminosity_threshold)
@@ -276,15 +276,15 @@ class Script(scripts.Script):
                     'schedule_params': daemon_schedule_params, 
                     'hires': hires,
                     'multiplier': .1,  # Add slider for this?
-                    noisetarget: noisetarget,
-                    textcond_percent: textcond_percent,
-                    noise_frequency: noise_frequency,
-                    luminosity_threshold: luminosity_threshold
+                    'noisetarget': noisetarget,
+                    'textcond_percent': textcond_percent,
+                    'noise_frequency': noise_frequency,
+                    'luminosity_threshold': luminosity_threshold
                 })
                 
                 text = ",".join([
                     str(int(active)), str(int(hires)), mode, f"{amount}", f"{start}", f"{end}", f"{bias}",
-                    f"{exponent}", f"{start_offset}", f"{end_offset}", f"{fade:}", str(int(smooth)), str(int(noisetarget)), str(textcond_percent), str(noise_frequency), str(luminosity_threshold)
+                    f"{exponent}", f"{start_offset}", f"{end_offset}", f"{fade:}", str(int(smooth)), noisetarget, str(textcond_percent), str(noise_frequency), str(luminosity_threshold)
                 ])
                 extra_gen_texts.append(f"D{i+1}:{text}")
         

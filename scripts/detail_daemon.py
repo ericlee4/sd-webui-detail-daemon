@@ -92,10 +92,10 @@ def generate_noise(batch, channels, h, w, specified_noise_size, mode, dtype, int
     return low_res
 
 
-def visualize_noise(noise_size, noise_upscale, interpolate, seed):
-    noise_tensor = generate_noise(1, 16, 128, 128, noise_size, noise_upscale, torch.float32, interpolate, seed)
+def visualize_noise(noise_size, noise_upscale, interpolate, seed, h, w):
+    noise_tensor = generate_noise(1, 16, h // 8, w // 8, noise_size, noise_upscale, torch.float32, interpolate, seed)
     img_data = noise_tensor[0, 0].detach().cpu().numpy()
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots()
     ax.imshow(img_data, cmap='viridis')
     plt.close(fig)
     return fig
@@ -159,35 +159,56 @@ class Script(scripts.Script):
                                     gr_noise_size = gr.Slider(minimum=0, maximum=1, step=0.001, value=.8, label="Noise Size", info='The size of the noise "blobs" as a percentage of the image size (exponential)')
                                     gr_noise_upscale = gr.Radio(choices=["nearest", "bilinear", "bicubic"], value="bicubic", label="Noise Upscale")
                                     gr_noise_seed = gr.Number(-1, label="Latent Noise Seed", minimum=-1, precision=0)
+                                    gr_noise_width = gr.Number(128, label="Latent Noise Width", minimum=1, precision=0)
+                                    gr_noise_height = gr.Number(128, label="Latent Noise Height", minimum=1, precision=0)
+                                    gr_refresh_plots = gr.Button(value="Refresh plots with gen params")
 
                                 gr_luminosity_threshold = gr.Slider(minimum=0.0, maximum=1.0, step=.05, value=0, label="Noise Luminosity Threshold", min_width=60)
                             with gr.Column(scale=1, min_width=275):
                                 preview, _ = self.visualize(False, 0.2, 0.8, 0.5, 0.1, 1, 0, 0, 0, True, 'both', False)
                                 gr_vis = gr.Plot(value=preview, elem_classes=['detail-daemon-vis'], show_label=False)
                                 gr_smooth = gr.Checkbox(label="Smooth", value=True, min_width=60, elem_classes=['detail-daemon-smooth'])
-                                fixed_seed = random.randint(0, 2**32 - 1)
 
-                                def visualize_noise_with_seed(size, upscale, seed):
-                                    use_seed = seed
-                                    if use_seed == -1:
-                                        use_seed = fixed_seed
+                            fixed_seed = random.randint(0, 2**32 - 1)
+                            def visualize_noise_with_seed(size, upscale, seed, h, w):
+                                use_seed = seed
+                                if use_seed == -1:
+                                    use_seed = fixed_seed
 
-                                    return [gr.Plot(visualize_noise(size, upscale, True, use_seed)), gr.Plot(visualize_noise(size, upscale, False, use_seed))]
+                                return [
+                                    gr.Plot(visualize_noise(size, upscale, True, use_seed, h, w)),
+                                    gr.Plot(visualize_noise(size, upscale, False, use_seed, h, w))
+                                ]
 
-                                gr_noise_plot = gr.Plot(visible=False, label="Upscaled Noise")
-                                gr_lowres_noise_plot = gr.Plot(visible=False, label="Noise")
-                                def update_fixed_seed(seed):
-                                    if seed == -1:
-                                        nonlocal fixed_seed
-                                        fixed_seed = random.randint(0, 2**32 - 1)
+                            gr_noise_plot = gr.Plot(visible=False, label="Upscaled Noise")
+                            gr_lowres_noise_plot = gr.Plot(visible=False, label="Noise")
+                            def update_fixed_seed(seed):
+                                if seed == -1:
+                                    nonlocal fixed_seed
+                                    fixed_seed = random.randint(0, 2**32 - 1)
 
-                                gr_noise_seed.change(update_fixed_seed, inputs=[gr_noise_seed])
-                                gr.on(
-                                    triggers=[gr_noisetarget.change, gr_noise_size.release, gr_noise_upscale.change, gr_noise_seed.change],
-                                    fn=visualize_noise_with_seed,
-                                    inputs=[gr_noise_size, gr_noise_upscale, gr_noise_seed],
-                                    outputs=[gr_noise_plot, gr_lowres_noise_plot]
-                                )
+                            gr_noise_seed.change(update_fixed_seed, inputs=[gr_noise_seed])
+                            gr.on(
+                                triggers=[gr_noisetarget.change, gr_noise_size.release, gr_noise_upscale.change, gr_noise_seed.change, gr_noise_height.change, gr_noise_width.change],
+                                fn=visualize_noise_with_seed,
+                                inputs=[gr_noise_size, gr_noise_upscale, gr_noise_seed, gr_noise_height, gr_noise_width],
+                                outputs=[gr_noise_plot, gr_lowres_noise_plot]
+                            )
+
+                            js_get_image_gen_params = """
+                            (is_img2img) => {
+                                const idSelector = is_img2img ? "#img2img" : "#txt2img";
+                                const app = gradioApp();
+                                const seed = app.querySelector(idSelector + '_seed input')?.value;
+                                const w = app.querySelector(idSelector + '_width input')?.value;
+                                const h = app.querySelector(idSelector + '_height input')?.value;
+                                return [Number(seed), Number(w), Number(h)];
+                            }
+                            """
+                            def refresh_plots(_, seed, w, h):
+                                return [gr.Number(seed), gr.Number(h), gr.Number(w)]
+
+                            gr_refresh_plots.click(fn=refresh_plots, inputs=[gr.State(is_img2img), gr_noise_seed, gr_noise_width, gr_noise_height], outputs=[gr_noise_seed, gr_noise_height, gr_noise_width], js=js_get_image_gen_params)
 
                         with gr.Accordion("More Knobs:", elem_classes=['detail-daemon-more-accordion'], open=False):
                             with gr.Row():

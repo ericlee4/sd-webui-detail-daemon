@@ -79,7 +79,6 @@ def generate_noise(batch, channels, h, w, specified_noise_size, mode, dtype, int
     low_w = max(1, int(w - (w - 1) * noise_size))
     gen = torch.Generator()
     if seed != -1:
-        print("setting manual noise seed: " + str(seed))
         gen.manual_seed(seed)
     else:
         gen.seed()

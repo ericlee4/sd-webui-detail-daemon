@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from modules.sd_models import FakeInitialModel
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
@@ -15,6 +17,7 @@ import modules.scripts as scripts
 from modules.script_callbacks import on_cfg_denoiser, remove_callbacks_for_function, on_infotext_pasted, on_ui_settings
 from modules.ui_components import InputAccordion
 from modules import shared
+from modules import devices
 
 try:
     import modules_forge.forge_version
@@ -58,7 +61,8 @@ def parse_infotext(infotext, params):
                 dd_dict[f"textcond_percent{idx + 1 if idx > 0 else ''}"] = float(vals[13])
                 dd_dict[f"noise_size{idx + 1 if idx > 0 else ''}"] = float(vals[14])
                 dd_dict[f"noise_upscale{idx + 1 if idx > 0 else ''}"] = vals[15]
-                dd_dict[f"luminosity_threshold{idx + 1 if idx > 0 else ''}"] = float(vals[16])
+                dd_dict[f"noise_seed{idx + 1 if idx > 0 else ''}"] = float(vals[16])
+                dd_dict[f"luminosity_threshold{idx + 1 if idx > 0 else ''}"] = float(vals[17])
             params['Detail Daemon'] = dd_dict
         else:
             # fallback to old format for backward compatibility
@@ -73,33 +77,91 @@ def parse_infotext(infotext, params):
 on_infotext_pasted(parse_infotext)
 
 
-def generate_noise(batch, channels, h, w, specified_noise_size, mode, dtype, interpolate, seed):
-    noise_size = specified_noise_size**0.5
+def generate_noise(batch, channels, h, w, specified_noise_size, mode, interpolate, seed):
+    noise_size = specified_noise_size**0.25
     low_h = max(1, int(h - (h - 1) * noise_size))
     low_w = max(1, int(w - (w - 1) * noise_size))
+    mode = "nearest" if low_h == 0 or low_w == 0 else mode
     gen = torch.Generator()
+
     if seed != -1:
         gen.manual_seed(seed)
     else:
         gen.seed()
 
-    low_res = torch.randn((batch, channels, low_h, low_w), device="cpu", dtype=dtype, generator=gen)
+    low_res = torch.randn((batch, channels, low_h, low_w), dtype=torch.float32, device="cpu", generator=gen)
     if interpolate:
-        blobs = F.interpolate(low_res, size=(h, w), mode=mode)
-        blobs = (blobs - blobs.mean()) / (blobs.std() + 1e-6)
+        if low_h == 1 or low_w == 1:
+            mode = "nearest"
+
+        blobs = F.interpolate(low_res, size=(h, w), mode=mode, align_corners=False if mode != "nearest" else None)
         return blobs
 
     return low_res
 
 
-def visualize_noise(noise_size, noise_upscale, interpolate, seed, h, w):
-    noise_tensor = generate_noise(1, 16, h // 8, w // 8, noise_size, noise_upscale, torch.float32, interpolate, seed)
-    img_data = noise_tensor[0, 0].detach().cpu().numpy()
+def visualize_noise(multiplier, noise_size, noise_upscale, interpolate, seed, h, w):
+    noise_tensor = generate_noise(1, 16, h // 8, w // 8, noise_size, noise_upscale, interpolate, seed)
+    noise_tensor *= multiplier
+    img_data = noise_tensor[0].mean(0).detach().cpu().numpy()
     fig, ax = plt.subplots()
     ax.imshow(img_data, cmap='viridis')
     plt.close(fig)
     return fig
 
+def visualize_noise_gradio(multiplier, channels, noise_size, mode, interpolate, seed, h, w, instant_preview):
+    high_channels = channels > 4
+    no_model_loaded = isinstance(shared.sd_model, FakeInitialModel)
+    if shared.sd_model is None:
+        return np.zeros((h, w, 3))
+
+    blobs = generate_noise(1, channels, h // 8, w // 8, noise_size, mode, interpolate, seed)
+    blobs *= multiplier
+    device = devices.get_optimal_device()
+
+    if no_model_loaded or instant_preview:
+        factors = torch.tensor([
+            [-0.0346,  0.0244,  0.0681],
+            [ 0.0034,  0.0210,  0.0687],
+            [ 0.0275, -0.0668, -0.0433],
+            [-0.0174,  0.0160,  0.0617],
+            [ 0.0859,  0.0721,  0.0329],
+            [ 0.0004,  0.0383,  0.0115],
+            [ 0.0405,  0.0861,  0.0915],
+            [-0.0236, -0.0185, -0.0259],
+            [-0.0245,  0.0250,  0.1180],
+            [ 0.1008,  0.0755, -0.0421],
+            [-0.0515,  0.0201,  0.0011],
+            [ 0.0428, -0.0012, -0.0036],
+            [ 0.0817,  0.0765,  0.0749],
+            [-0.1264, -0.0522, -0.1103],
+            [-0.0280, -0.0881, -0.0499],
+            [-0.1262, -0.0982, -0.0778],
+        ])
+        latent_tensor = blobs[0].permute(1, 2, 0)
+        factors_tensor = torch.tensor(factors)
+        rgb_preview = latent_tensor @ factors_tensor
+        rgb_preview = (rgb_preview + 0.5).clamp(0, 1)
+
+        return (rgb_preview.cpu().numpy() * 255).astype('uint8')
+    # elif instant_preview:
+    #     with torch.no_grad():
+    #         blobs_input = blobs.to(device=device, dtype=torch.float32)
+    #         vga_approx = sd_vae_approx.cheap_approximation(blobs_input)
+    #         decoded_hwc = vga_approx[0].permute(1, 2, 0).clamp(0, 1)
+    #         return (decoded_hwc * 255).cpu().numpy().astype('uint8')
+    else:
+        with torch.no_grad(), devices.autocast():
+            blobs = blobs.to(device=device)
+            scale_factor = 0.3611 if high_channels else 0.18215
+            shift_factor = 0.1159 if high_channels else 0
+            latents = (blobs / scale_factor) + shift_factor
+            decoded = shared.sd_model.decode_first_stage(latents)
+
+            # Post-process: [-1, 1] -> [0, 255] uint8
+            decoded = (decoded[0] / 2 + 0.5).clamp(0, 1)
+            decoded = (decoded.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
+            return decoded
 
 class Script(scripts.Script):
 
@@ -159,56 +221,21 @@ class Script(scripts.Script):
                                     gr_noise_size = gr.Slider(minimum=0, maximum=1, step=0.001, value=.8, label="Noise Size", info='The size of the noise "blobs" as a percentage of the image size (exponential)')
                                     gr_noise_upscale = gr.Radio(choices=["nearest", "bilinear", "bicubic"], value="bicubic", label="Noise Upscale")
                                     gr_noise_seed = gr.Number(-1, label="Latent Noise Seed", minimum=-1, precision=0)
-                                    gr_noise_width = gr.Number(128, label="Latent Noise Width", minimum=1, precision=0)
-                                    gr_noise_height = gr.Number(128, label="Latent Noise Height", minimum=1, precision=0)
-                                    gr_refresh_plots = gr.Button(value="Refresh plots with gen params")
+                                    with gr.Row():
+                                        gr_noise_width = gr.Number(1024, label="Latent Noise Width", minimum=1, precision=0)
+                                        gr_noise_height = gr.Number(1024, label="Latent Noise Height", minimum=1, precision=0)
+                                    gr_refresh_plots = gr.Button(value="Copy generation params here")
+                                    gr_instant_preview = gr.Checkbox(False, label="Approx. VAE Preview")
+                                    noise_preview = gr.Image(label="Latent Noise Visualization", height=256, interactive=False)
+                                    with gr.Row():
+                                        gr_noise_plot = gr.Plot(visible=False, label="Upscaled Noise")
+                                        gr_lowres_noise_plot = gr.Plot(visible=False, label="Noise")
 
                                 gr_luminosity_threshold = gr.Slider(minimum=0.0, maximum=1.0, step=.05, value=0, label="Noise Luminosity Threshold", min_width=60)
                             with gr.Column(scale=1, min_width=275):
                                 preview, _ = self.visualize(False, 0.2, 0.8, 0.5, 0.1, 1, 0, 0, 0, True, 'both', False)
                                 gr_vis = gr.Plot(value=preview, elem_classes=['detail-daemon-vis'], show_label=False)
                                 gr_smooth = gr.Checkbox(label="Smooth", value=True, min_width=60, elem_classes=['detail-daemon-smooth'])
-
-                            fixed_seed = random.randint(0, 2**32 - 1)
-                            def visualize_noise_with_seed(size, upscale, seed, h, w):
-                                use_seed = seed
-                                if use_seed == -1:
-                                    use_seed = fixed_seed
-
-                                return [
-                                    gr.Plot(visualize_noise(size, upscale, True, use_seed, h, w)),
-                                    gr.Plot(visualize_noise(size, upscale, False, use_seed, h, w))
-                                ]
-
-                            gr_noise_plot = gr.Plot(visible=False, label="Upscaled Noise")
-                            gr_lowres_noise_plot = gr.Plot(visible=False, label="Noise")
-                            def update_fixed_seed(seed):
-                                if seed == -1:
-                                    nonlocal fixed_seed
-                                    fixed_seed = random.randint(0, 2**32 - 1)
-
-                            gr_noise_seed.change(update_fixed_seed, inputs=[gr_noise_seed])
-                            gr.on(
-                                triggers=[gr_noisetarget.change, gr_noise_size.release, gr_noise_upscale.change, gr_noise_seed.change, gr_noise_height.change, gr_noise_width.change],
-                                fn=visualize_noise_with_seed,
-                                inputs=[gr_noise_size, gr_noise_upscale, gr_noise_seed, gr_noise_height, gr_noise_width],
-                                outputs=[gr_noise_plot, gr_lowres_noise_plot]
-                            )
-
-                            js_get_image_gen_params = """
-                            (is_img2img) => {
-                                const idSelector = is_img2img ? "#img2img" : "#txt2img";
-                                const app = gradioApp();
-                                const seed = app.querySelector(idSelector + '_seed input')?.value;
-                                const w = app.querySelector(idSelector + '_width input')?.value;
-                                const h = app.querySelector(idSelector + '_height input')?.value;
-                                return [Number(seed), Number(w), Number(h)];
-                            }
-                            """
-                            def refresh_plots(_, seed, w, h):
-                                return [gr.Number(seed), gr.Number(h), gr.Number(w)]
-
-                            gr_refresh_plots.click(fn=refresh_plots, inputs=[gr.State(is_img2img), gr_noise_seed, gr_noise_width, gr_noise_height], outputs=[gr_noise_seed, gr_noise_height, gr_noise_width], js=js_get_image_gen_params)
 
                         with gr.Accordion("More Knobs:", elem_classes=['detail-daemon-more-accordion'], open=False):
                             with gr.Row():
@@ -235,6 +262,57 @@ class Script(scripts.Script):
                                 vis_arg.release(fn=self.visualize, show_progress=False, inputs=vis_args, outputs=[gr_vis, thumbs[i]])
                             else:
                                 vis_arg.change(fn=self.visualize, show_progress=False, inputs=vis_args, outputs=[gr_vis, thumbs[i]])
+
+
+                        fixed_seed = random.randint(0, 2**32 - 1)
+                        def visualize_noise_with_seed(multiplier, size, upscale, seed, h, w):
+                            use_seed = seed
+                            if use_seed == -1:
+                                use_seed = fixed_seed
+
+                            return [
+                                gr.Plot(visualize_noise(multiplier, size, upscale, True, use_seed, h, w)),
+                                gr.Plot(visualize_noise(multiplier, size, upscale, False, use_seed, h, w))
+                            ]
+
+                        def update_fixed_seed(seed):
+                            if seed == -1:
+                                nonlocal fixed_seed
+                                fixed_seed = random.randint(0, 2**32 - 1)
+
+                        gr_noise_seed.change(update_fixed_seed, inputs=[gr_noise_seed])
+                        gr.on(
+                            triggers=[gr_amount.change, gr_noisetarget.change, gr_noise_size.release, gr_noise_upscale.change, gr_noise_seed.change, gr_noise_height.change, gr_noise_width.change],
+                            fn=visualize_noise_with_seed,
+                            inputs=[gr_amount, gr_noise_size, gr_noise_upscale, gr_noise_seed, gr_noise_height, gr_noise_width],
+                            outputs=[gr_noise_plot, gr_lowres_noise_plot]
+                        )
+
+                        js_get_image_gen_params = """
+                        (is_img2img) => {
+                            const idSelector = is_img2img ? "#img2img" : "#txt2img";
+                            const app = gradioApp();
+                            const seed = app.querySelector(idSelector + '_seed input')?.value;
+                            const w = app.querySelector(idSelector + '_width input')?.value;
+                            const h = app.querySelector(idSelector + '_height input')?.value;
+                            return [Number(seed), Number(w), Number(h)];
+                        }
+                        """
+                        def refresh_plots(_, seed, w, h):
+                            return [gr.Number(seed), gr.Number(h), gr.Number(w)]
+
+                        gr_refresh_plots.click(fn=refresh_plots, inputs=[gr.State(is_img2img), gr_noise_seed, gr_noise_width, gr_noise_height], outputs=[gr_noise_seed, gr_noise_height, gr_noise_width], js=js_get_image_gen_params)
+
+                        def gen_img(multiplier, noise_size, mode, seed, h, w, instant_preview):
+                            return visualize_noise_gradio(multiplier, 16 if w > 512 else 4, noise_size, mode, True, seed, h, w, instant_preview)
+                        gr.on(
+                            triggers=[gr_amount.change, gr_refresh_plots.click, gr_noisetarget.change, gr_noise_size.release,
+                                      gr_noise_upscale.change, gr_noise_seed.change, gr_noise_height.change,
+                                      gr_noise_width.change, gr_instant_preview.change],
+                            fn=gen_img,
+                            inputs=[gr_amount, gr_noise_size, gr_noise_upscale, gr_noise_seed, gr_noise_height, gr_noise_width, gr_instant_preview],
+                            outputs=[noise_preview]
+                        )
 
                         def update_noise_target_visibility(target):
                             is_textcond = target == "textcond"
@@ -446,11 +524,11 @@ class Script(scripts.Script):
                     batch, channels, h, w = params.x.shape
                     noise_size = daemon["noise_size"]
                     noise_seed = daemon["noise_seed"]
-                    blobs = generate_noise(batch, channels, h, w, noise_size, daemon["noise_upscale"], params.x.dtype, True, noise_seed if noise_seed != -1 else params.denoiser.p.seed)
-                    blobs = blobs.to(params.x.device)
-                    blobs *= params.x.std()
-                    scheduleval = float(schedule[idx])
-                    params.x = (1.0 - scheduleval**2)**0.5 * params.x + scheduleval * blobs
+                    blobs = generate_noise(batch, channels, h, w, noise_size, daemon["noise_upscale"], True, noise_seed if noise_seed != -1 else params.denoiser.p.seed)
+                    blobs = blobs.to(dtype=params.x.dtype, device=params.x.device)
+                    strength = schedule[idx] * 0.5
+                    blobs = (blobs - blobs.mean()) / (blobs.std() + 1e-6)
+                    params.x = (1.0 - min(1, strength)**2)**0.5 * params.x + strength * blobs
                 else:
                     threshold = daemon.get("luminosity_threshold", 0)
 

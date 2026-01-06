@@ -1,5 +1,6 @@
 import os
 import random
+from typing import Any, Callable, List, Tuple
 
 import gradio as gr
 import matplotlib
@@ -10,6 +11,26 @@ from tqdm import tqdm
 
 from modules.sd_models import FakeInitialModel
 
+FLUX_RGB_FACTORS = [
+    [-0.0346, 0.0244, 0.0681],
+    [0.0034, 0.0210, 0.0687],
+    [0.0275, -0.0668, -0.0433],
+    [-0.0174, 0.0160, 0.0617],
+    [0.0859, 0.0721, 0.0329],
+    [0.0004, 0.0383, 0.0115],
+    [0.0405, 0.0861, 0.0915],
+    [-0.0236, -0.0185, -0.0259],
+    [-0.0245, 0.0250, 0.1180],
+    [0.1008, 0.0755, -0.0421],
+    [-0.0515, 0.0201, 0.0011],
+    [0.0428, -0.0012, -0.0036],
+    [0.0817, 0.0765, 0.0749],
+    [-0.1264, -0.0522, -0.1103],
+    [-0.0280, -0.0881, -0.0499],
+    [-0.1262, -0.0982, -0.0778],
+]
+FLUX_LATENT_RGB_FACTORS_BIAS = [-0.0329, -0.0718, -0.0851]
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
@@ -18,6 +39,7 @@ from modules.script_callbacks import on_cfg_denoiser, remove_callbacks_for_funct
 from modules.ui_components import InputAccordion
 from modules import shared
 from modules import devices
+from PIL import ImageColor
 
 try:
     import modules_forge.forge_version
@@ -45,24 +67,36 @@ def parse_infotext(infotext, params):
             for idx, daemon in enumerate(daemons):
                 tag, values = daemon.split(":")
                 vals = values.split(",")
-                dd_dict[f"active{idx + 1 if idx > 0 else ''}"] = bool(int(vals[0]))
-                dd_dict[f"hr{idx + 1 if idx > 0 else ''}"] = bool(int(vals[1]))
-                dd_dict[f"mode{idx + 1 if idx > 0 else ''}"] = vals[2]
-                dd_dict[f"amount{idx + 1 if idx > 0 else ''}"] = float(vals[3])
-                dd_dict[f"st{idx + 1 if idx > 0 else ''}"] = float(vals[4])
-                dd_dict[f"ed{idx + 1 if idx > 0 else ''}"] = float(vals[5])
-                dd_dict[f"bias{idx + 1 if idx > 0 else ''}"] = float(vals[6])
-                dd_dict[f"exp{idx + 1 if idx > 0 else ''}"] = float(vals[7])
-                dd_dict[f"st_offset{idx + 1 if idx > 0 else ''}"] = float(vals[8])
-                dd_dict[f"ed_offset{idx + 1 if idx > 0 else ''}"] = float(vals[9])
-                dd_dict[f"fade{idx + 1 if idx > 0 else ''}"] = float(vals[10])
-                dd_dict[f"smooth{idx + 1 if idx > 0 else ''}"] = bool(int(vals[11]))
-                dd_dict[f"noisetarget{idx + 1 if idx > 0 else ''}"] = vals[12]
-                dd_dict[f"textcond_percent{idx + 1 if idx > 0 else ''}"] = float(vals[13])
-                dd_dict[f"noise_size{idx + 1 if idx > 0 else ''}"] = float(vals[14])
-                dd_dict[f"noise_upscale{idx + 1 if idx > 0 else ''}"] = vals[15]
-                dd_dict[f"noise_seed{idx + 1 if idx > 0 else ''}"] = float(vals[16])
-                dd_dict[f"luminosity_threshold{idx + 1 if idx > 0 else ''}"] = float(vals[17])
+                daemon_idx = str(idx + 1) if idx > 0 else ''
+                fields: List[Tuple[str, Callable[[Any], Any]]] = [
+                    ("active", lambda v: bool(int(v))),
+                    ("hr", lambda v: bool(int(v))),
+                    ("mode", str),
+                    ("amount", float),
+                    ("st", float),
+                    ("ed", float),
+                    ("bias", float),
+                    ("exp", float),
+                    ("st_offset", float),
+                    ("ed_offset", float),
+                    ("fade", float),
+                    ("smooth", lambda v: bool(int(v))),
+                    ("noisetarget", str),
+                    ("textcond_percent", float),
+                    ("noise_size", float),
+                    ("noise_upscale", str),
+                    ("noise_seed", float),
+                    ("luminosity_threshold", float),
+                    ("noise_color", str),
+                    ("noise_color_enabled", lambda v: bool(int(v))),
+                    ("noise_color_strength", float),
+                    ("noise_width", int),
+                    ("noise_height", int),
+                ]
+                for i, val in enumerate(vals):
+                    field, converter = fields[i]
+                    dd_dict[field + daemon_idx] = converter(val)
+
             params['Detail Daemon'] = dd_dict
         else:
             # fallback to old format for backward compatibility
@@ -71,8 +105,8 @@ def parse_infotext(infotext, params):
                 k, _, v = s.partition(':')
                 d[k.strip()] = v.strip()
             params['Detail Daemon'] = d
-    except Exception:
-        pass
+    except Exception as e:
+        print("Error Parsing", e)
 
 on_infotext_pasted(parse_infotext)
 
@@ -81,7 +115,7 @@ def generate_noise(batch, channels, h, w, specified_noise_size, mode, interpolat
     noise_size = specified_noise_size**0.25
     low_h = max(1, int(h - (h - 1) * noise_size))
     low_w = max(1, int(w - (w - 1) * noise_size))
-    mode = "nearest" if low_h == 0 or low_w == 0 else mode
+    mode = "nearest" if low_h == 1 or low_w == 1 else mode
     gen = torch.Generator()
 
     if seed != -1:
@@ -120,24 +154,7 @@ def visualize_noise_gradio(multiplier, channels, noise_size, mode, interpolate, 
     device = devices.get_optimal_device()
 
     if no_model_loaded or instant_preview:
-        factors = torch.tensor([
-            [-0.0346,  0.0244,  0.0681],
-            [ 0.0034,  0.0210,  0.0687],
-            [ 0.0275, -0.0668, -0.0433],
-            [-0.0174,  0.0160,  0.0617],
-            [ 0.0859,  0.0721,  0.0329],
-            [ 0.0004,  0.0383,  0.0115],
-            [ 0.0405,  0.0861,  0.0915],
-            [-0.0236, -0.0185, -0.0259],
-            [-0.0245,  0.0250,  0.1180],
-            [ 0.1008,  0.0755, -0.0421],
-            [-0.0515,  0.0201,  0.0011],
-            [ 0.0428, -0.0012, -0.0036],
-            [ 0.0817,  0.0765,  0.0749],
-            [-0.1264, -0.0522, -0.1103],
-            [-0.0280, -0.0881, -0.0499],
-            [-0.1262, -0.0982, -0.0778],
-        ])
+        factors = torch.tensor(FLUX_RGB_FACTORS)
         latent_tensor = blobs[0].permute(1, 2, 0)
         factors_tensor = torch.tensor(factors)
         rgb_preview = latent_tensor @ factors_tensor
@@ -224,8 +241,12 @@ class Script(scripts.Script):
                                     with gr.Row():
                                         gr_noise_width = gr.Number(1024, label="Latent Noise Width", minimum=1, precision=0)
                                         gr_noise_height = gr.Number(1024, label="Latent Noise Height", minimum=1, precision=0)
+                                        gr_noise_color = gr.ColorPicker(value="#ffffff", label="Color shift")
+                                    with gr.Row():
+                                        gr_noise_color_enabled = gr.Checkbox(value=False, label="Color shift Enabled")
+                                        gr_noise_color_strength = gr.Slider(minimum=0, maximum=10, step=0.1, value=1, label="Color shift strength")
                                     gr_refresh_plots = gr.Button(value="Copy generation params here")
-                                    gr_instant_preview = gr.Checkbox(False, label="Approx. VAE Preview")
+                                    gr_instant_preview = gr.Checkbox(True, label="Fast Approx. VAE Preview")
                                     noise_preview = gr.Image(label="Latent Noise Visualization", height=256, interactive=False)
                                     with gr.Row():
                                         gr_noise_plot = gr.Plot(visible=False, label="Upscaled Noise")
@@ -330,7 +351,8 @@ class Script(scripts.Script):
                         params_set = [
                             gr_active, gr_hires, gr_mode, gr_start, gr_end, gr_bias, gr_amount,
                             gr_exponent, gr_start_offset, gr_end_offset, gr_fade, gr_smooth, gr_noisetarget,
-                            gr_textcond_percent, gr_noise_size, gr_noise_upscale, gr_noise_seed, gr_luminosity_threshold
+                            gr_textcond_percent, gr_noise_size, gr_noise_upscale, gr_noise_seed, gr_luminosity_threshold,
+                            gr_noise_color, gr_noise_color_enabled, gr_noise_color_strength,
                         ]
                         all_params.extend(params_set)
 
@@ -357,6 +379,11 @@ class Script(scripts.Script):
                                 (gr_noise_upscale, lambda d: extract_infotext(d, 'noise_upscale')),
                                 (gr_noise_seed, lambda d: extract_infotext(d, 'noise_seed')),
                                 (gr_luminosity_threshold, lambda d: extract_infotext(d, 'luminosity_threshold')),
+                                (gr_noise_color, lambda d: extract_infotext(d, 'noise_color')),
+                                (gr_noise_color_enabled, lambda d: extract_infotext(d, 'noise_color_enabled')),
+                                (gr_noise_color_strength, lambda d: extract_infotext(d, 'noise_color_strength')),
+                                (gr_noise_width, lambda d: extract_infotext(d, 'noise_width')),
+                                (gr_noise_height, lambda d: extract_infotext(d, 'noise_height')),
                             ])
                         else:
                             tab_tag = i + 1
@@ -378,7 +405,11 @@ class Script(scripts.Script):
                                 (gr_noise_size, lambda d, key=f'noise_size{tab_tag}': extract_infotext(d, key)),
                                 (gr_noise_upscale, lambda d, key=f'noise_upscale{tab_tag}': extract_infotext(d, key)),
                                 (gr_noise_seed, lambda d, key=f'noise_seed{tab_tag}': extract_infotext(d, key)),
-                                (gr_luminosity_threshold, lambda d, key=f'luminosity_threshold{tab_tag}': extract_infotext(d, key)),
+                                (gr_noise_color, lambda d, key=f'noise_color{tab_tag}': extract_infotext(d, key)),
+                                (gr_noise_color_enabled, lambda d, key=f'noise_color_enabled{tab_tag}': extract_infotext(d, key)),
+                                (gr_noise_color_strength, lambda d, key=f'noise_color_strength{tab_tag}': extract_infotext(d, key)),
+                                (gr_noise_width, lambda d, key=f'noise_width{tab_tag}': extract_infotext(d, key)),
+                                (gr_noise_height, lambda d, key=f'noise_height{tab_tag}': extract_infotext(d, key)),
                             ])
         return all_params
 
@@ -402,7 +433,7 @@ class Script(scripts.Script):
             end_idx = start_idx + self.tab_param_count
             daemon_args = all_daemon_args[start_idx:end_idx]
 
-            active, hires, mode, start, end, bias, amount, exponent, start_offset, end_offset, fade, smooth, noisetarget, textcond_percent, noise_size, noise_upscale, noise_seed, luminosity_threshold = daemon_args
+            active, hires, mode, start, end, bias, amount, exponent, start_offset, end_offset, fade, smooth, noisetarget, textcond_percent, noise_size, noise_upscale, noise_seed, luminosity_threshold, noise_color, noise_color_enabled, noise_color_strength = daemon_args
 
             # TODO? XYZ support for other channels
             if (i == 0) :
@@ -422,6 +453,9 @@ class Script(scripts.Script):
                 noise_upscale = getattr(p, "DD_noise_upscale", noise_upscale)
                 noise_seed = getattr(p, "DD_noise_seed", noise_seed)
                 luminosity_threshold = getattr(p, "DD_luminosity_threshold", luminosity_threshold)
+                noise_color = getattr(p, "DD_noise_color", noise_color)
+                noise_color_enabled = getattr(p, "DD_noise_color_enabled", noise_color_enabled)
+                noise_color_strength = getattr(p, "DD_noise_color_strength", noise_color_strength)
 
             if active:
                 daemon_schedule_params = {
@@ -448,13 +482,16 @@ class Script(scripts.Script):
                     'noise_size': noise_size,
                     'noise_upscale': noise_upscale,
                     'noise_seed': noise_seed,
-                    'luminosity_threshold': luminosity_threshold
+                    'luminosity_threshold': luminosity_threshold,
+                    'noise_color': noise_color,
+                    'noise_color_enabled': noise_color_enabled,
+                    'noise_color_strength': noise_color_strength,
                 })
 
                 text = ",".join([
                     str(int(active)), str(int(hires)), mode, f"{amount}", f"{start}", f"{end}", f"{bias}",
                     f"{exponent}", f"{start_offset}", f"{end_offset}", f"{fade:}", str(int(smooth)),
-                    noisetarget, str(textcond_percent), str(noise_size), noise_upscale, str(noise_seed), str(luminosity_threshold)
+                    noisetarget, str(textcond_percent), str(noise_size), noise_upscale, str(noise_seed), str(luminosity_threshold), noise_color, str(int(noise_color_enabled)), str(noise_color_strength)
                 ])
                 extra_gen_texts.append(f"D{i+1}:{text}")
 
@@ -527,7 +564,19 @@ class Script(scripts.Script):
                     blobs = generate_noise(batch, channels, h, w, noise_size, daemon["noise_upscale"], True, noise_seed if noise_seed != -1 else params.denoiser.p.seed)
                     blobs = blobs.to(dtype=params.x.dtype, device=params.x.device)
                     strength = schedule[idx] * 0.5
-                    blobs = (blobs - blobs.mean()) / (blobs.std() + 1e-6)
+
+                    if daemon["noise_color_enabled"]:
+                        user_hex_color = daemon["noise_color"]
+                        rgb = ImageColor.getrgb(user_hex_color)
+                        rgb = [c / 255.0 for c in rgb]
+                        factors = torch.tensor(FLUX_RGB_FACTORS, device=blobs.device, dtype=blobs.dtype)
+                        rgb_bias = torch.tensor(FLUX_LATENT_RGB_FACTORS_BIAS, device=blobs.device, dtype=blobs.dtype)
+                        color_rgb = torch.tensor(rgb, device=blobs.device, dtype=blobs.dtype) - rgb_bias
+                        color_vec = torch.matmul(factors, color_rgb).view(1, channels, 1, 1)
+                        color_vec = color_vec / (color_vec.std() + 1e-6)
+                        color_strength = daemon["noise_color_strength"]
+                        blobs = (1 - color_strength) * blobs + color_vec * daemon["noise_color_strength"]
+
                     params.x = (1.0 - min(1, strength)**2)**0.5 * params.x + strength * blobs
                 else:
                     threshold = daemon.get("luminosity_threshold", 0)
